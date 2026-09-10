@@ -1,0 +1,6 @@
+template-file-path: infra.yaml
+parameters:
+  ProjectName: Example
+  DomainName: app.example.net
+  GitHubRepository: your-org/your-repo
+  HostedZoneId: your-hostedzone-id

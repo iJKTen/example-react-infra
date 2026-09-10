@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: S3 hosting, CloudFront, CI/CD pipeline, and Route 53 for a React SPA.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Prefix used for naming all resources (e.g. SyncSentrySaas). Must start with a letter and contain only alphanumeric characters.
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters.
+
+  DomainName:
+    Type: String
+    Description: Fully qualified domain name for the site (example.net).
+
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository in owner/repo format (e.g. your-org/your-repo).
+
+  GitHubBranch:
+    Type: String
+    Description: Branch to track for CI/CD pipeline.
+    Default: main
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for the domain.
+
+  BuildOutputDirectory:
+    Type: String
+    Description: Build output directory for the SPA framework.
+    Default: dist
+
+Resources:
+  S3WebsiteBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AutoCleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+
+  PipelineArtifactBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 3
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArtifactBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref PipelineArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt PipelineArtifactBucket.Arn
+              - !Sub '${PipelineArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref S3WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only allow requests coming from CloudFront and the only action it can access is GET
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${S3WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt S3WebsiteBucket.Arn
+              - !Sub '${S3WebsiteBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  BuildProject:
+    # CodeBuild Project to build react app
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${ProjectName}Build'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            base-directory: ${BuildOutputDirectory}
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - 'node_modules/**/*'
+
+  CodeBuildServiceRole:
+    # IAM Role assumed by CodeBuild to write logs to CloudWatch and read/write to the S3 artifact bucket.
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # TRUST POLICY: Defines WHO (the Principal) can assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}Build*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+
+  DeployProject:
+    # CodeBuild Project to deploy built assets to S3 with per-file cache headers.
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${ProjectName}Deploy'
+      ServiceRole: !GetAtt DeployServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOY_BUCKET
+            Value: !Ref S3WebsiteBucket
+          - Name: CLOUDFRONT_DIST_ID
+            Value: !Ref CloudFrontDistribution
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                # Hashed static assets: cache forever (hash changes on new builds)
+                - aws s3 sync . s3://$DEPLOY_BUCKET --delete --cache-control "max-age=31536000,public,immutable" --exclude "index.html"
+                # index.html: always revalidate to pick up new asset references
+                - aws s3 cp index.html s3://$DEPLOY_BUCKET/index.html --cache-control "max-age=0,no-cache,no-store,must-revalidate"
+            post_build:
+              commands:
+                - aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DIST_ID --paths "/*"
+
+  DeployServiceRole:
+    # IAM Role assumed by the Deploy CodeBuild project.
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}Deploy*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt S3WebsiteBucket.Arn
+                  - !Sub '${S3WebsiteBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'cloudfront:CreateInvalidation'
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  CodePipelineServiceRole:
+    # IAM Role assumed by CodePipeline to access S3, GitHub, and CodeBuild
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: PipelineAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: 'codestar-connections:UseConnection'
+                Resource: !ImportValue Example-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+
+  Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue Example-GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: BuildApp
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject
+        - Name: Deploy
+          Actions:
+            - Name: S3Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref DeployProject
+
+  CloudFrontOAC:
+    # Sign every request to S3 using SigV4 authentication.
+    Type: 'AWS::CloudFront::OriginAccessControl'
+    Properties:
+      OriginAccessControlConfig:
+        Description: !Sub "OAC for ${DomainName}"
+        Name: !Sub '${ProjectName}OAC'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Security headers policy for CloudFront
+  SecurityHeadersPolicy:
+    Type: 'AWS::CloudFront::ResponseHeadersPolicy'
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${ProjectName}SecurityHeaders'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          XSSProtection:
+            Protection: true
+            ModeBlock: true
+            Override: true
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+
+  SPARoutingFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}SPARouting'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrites non-asset paths to /index.html for SPA client-side routing
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          var isAsset = /\.(html|js|css|png|jpg|jpeg|gif|ico|svg|json|webp|woff|woff2|ttf|eot|map|txt|xml)$/i.test(uri);
+          if (isAsset) {
+            return request;
+          }
+          request.uri = '/index.html';
+          return request;
+        }
+
+  # CDN distribution that serves the SPA from the private S3 bucket.
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        Aliases:
+          - !Ref DomainName
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt S3WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS Managed CachingOptimized policy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SPARoutingFunction.FunctionARN
+        ViewerCertificate:
+          AcmCertificateArn: !ImportValue Example-CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  # DNS flow: Route53 -> CloudFront -> S3 bucket
+  DomainRecord:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  DomainRecordAAAA:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  WebsiteBucketName:
+    Description: S3 bucket hosting the website assets
+    Value: !Ref S3WebsiteBucket
+
+  SiteUrl:
+    Description: Live site URL
+    Value: !Sub 'https://${DomainName}'
