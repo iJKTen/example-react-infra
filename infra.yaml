@@ -86,6 +86,9 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
       Policies:
         - PolicyName: EmptyBucketAccess
           PolicyDocument:
@@ -262,6 +265,9 @@ Resources:
             Principal:
               Service: codebuild.amazonaws.com
             Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
       Policies:
         - PolicyName: CodeBuildAccess
           PolicyDocument:
@@ -325,6 +331,9 @@ Resources:
             Principal:
               Service: codebuild.amazonaws.com
             Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
       Policies:
         - PolicyName: DeployAccess
           PolicyDocument:
@@ -368,6 +377,9 @@ Resources:
             Principal:
               Service: codepipeline.amazonaws.com
             Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
       Policies:
         - PolicyName: PipelineAccessPolicy
           PolicyDocument:
