@@ -494,7 +494,7 @@ Resources:
             Override: true
           ContentSecurityPolicy:
             Override: true
-            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 
   SPARoutingFunction:
     Type: AWS::CloudFront::Function
@@ -508,7 +508,7 @@ Resources:
         function handler(event) {
           var request = event.request;
           var uri = request.uri;
-          var isAsset = /\.(html|js|css|png|jpg|jpeg|gif|ico|svg|json|webp|woff|woff2|ttf|eot|map|txt|xml)$/i.test(uri);
+          var isAsset = /\.(html|js|css|png|jpg|jpeg|gif|ico|svg|json|webp|woff|woff2|ttf|eot|map|txt|xml|mp4)$/i.test(uri);
           if (isAsset) {
             return request;
           }
